@@ -99,11 +99,23 @@ class RecordFreeze(Base):
 
 
 class Snapshot(Base):
-    """发布产生的不可变快照：只保存脱敏后的正文，后续修订不影响它。"""
+    """发布产生的不可变快照：只保存脱敏后的正文，后续修订不影响它。
+
+    统一外部阅览时段（opens_at/closes_at）：两列同时为空表示无时段限制
+    （既有快照默认如此）；同时非空时公开读取仅在 [opens_at, closes_at) 内
+    有效。时段随首次发布写入后不可改写：同一 (record_id, version) 的后续
+    签发只能沿用首次设置，显式填写不同时段一律冲突拒绝。
+    """
 
     __tablename__ = "snapshots"
     __table_args__ = (
         UniqueConstraint("record_id", "version", name="uq_snapshots_record_version"),
+        # 阅览时段成对出现且开放早于截止（两列同空表示无时段限制）
+        CheckConstraint(
+            "(opens_at IS NULL) = (closes_at IS NULL) "
+            "AND (opens_at IS NULL OR opens_at < closes_at)",
+            name="ck_snapshots_read_window",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -114,6 +126,14 @@ class Snapshot(Base):
     redacted_text: Mapped[str] = mapped_column(Text, nullable=False)
     published_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # 统一外部阅览时段：公开读取在开放时刻（含）起至截止时刻（不含）前有效，
+    # 以服务端资格判定时刻为准；均为空表示无时段限制。写入后不可改写。
+    opens_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    closes_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     # 永久撤回：withdrawn_at 为空表示仍公开；非空即永久不可公开读取。
     # 撤回只作用于本快照：同记录其他版本、历史脱敏正文与已批准申请均继续留存。
@@ -185,6 +205,12 @@ class PublishRequest(Base):
     __tablename__ = "publish_requests"
     __table_args__ = (
         CheckConstraint("status IN ('pending', 'approved', 'rejected')", name="ck_publish_requests_status"),
+        # 冻结的阅览时段成对出现且开放早于截止（两列同空表示无时段限制）
+        CheckConstraint(
+            "(opens_at IS NULL) = (closes_at IS NULL) "
+            "AND (opens_at IS NULL OR opens_at < closes_at)",
+            name="ck_publish_requests_read_window",
+        ),
         Index("ix_publish_requests_record", "record_id", "created_at"),
     )
 
@@ -209,6 +235,15 @@ class PublishRequest(Base):
     token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 读取次数上限（申请时冻结）：NULL 表示不限次，批准后原样落到新令牌
     token_max_reads: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # 快照统一外部阅览时段（提交时冻结）：NULL/NULL 表示无时段限制；
+    # 批准签发时落到新快照上（该版本已有快照时只能沿用其首次设置）。
+    opens_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    closes_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # 批准后同事务生成的快照（驳回时保持为空；令牌经 snapshot_id 关联，不在此冗余）
     snapshot_id: Mapped[uuid.UUID | None] = mapped_column(

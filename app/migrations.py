@@ -223,6 +223,52 @@ def _migrate_5_sensitive_phrases(conn) -> None:
     )
 
 
+def _migrate_6_snapshot_read_windows(conn) -> None:
+    """v6：快照统一外部阅览时段（开放/截止时刻）列与成对校验约束。
+
+    空库路径下 v1 的 create_all 已按当前模型建出全部新列与 CHECK 约束，此处
+    幂等；旧库路径幂等补列：既有快照与既有待审申请的新列一律为 NULL/NULL
+    （无时段限制），公开读取与发布语义完全不变。CHECK 约束以 DO 块判定存在性，
+    保证“空库建表已含约束”与“旧库补列后补约束”两条路径收敛到同一定义。
+    """
+    Base.metadata.create_all(bind=conn, checkfirst=True)
+    statements: list[str] = [
+        # 快照阅览时段：NULL/NULL 表示无时段限制（既有快照默认如此）
+        "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS opens_at TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS closes_at TIMESTAMP WITH TIME ZONE",
+        # 受控申请在提交时冻结的阅览时段
+        "ALTER TABLE publish_requests ADD COLUMN IF NOT EXISTS opens_at TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE publish_requests ADD COLUMN IF NOT EXISTS closes_at TIMESTAMP WITH TIME ZONE",
+    ]
+    for statement in statements:
+        conn.execute(text(statement))
+    # 成对且有序的校验约束：两列同空（无时段限制）或同非空且开放早于截止
+    for table, constraint in (
+        ("snapshots", "ck_snapshots_read_window"),
+        ("publish_requests", "ck_publish_requests_read_window"),
+    ):
+        conn.execute(
+            text(
+                f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = '{constraint}'
+                          AND conrelid = '{table}'::regclass
+                    ) THEN
+                        ALTER TABLE {table} ADD CONSTRAINT {constraint}
+                        CHECK (
+                            (opens_at IS NULL) = (closes_at IS NULL)
+                            AND (opens_at IS NULL OR opens_at < closes_at)
+                        );
+                    END IF;
+                END $$
+                """
+            )
+        )
+
+
 # (版本号, 版本名称, 升级函数)。追加新版本时只允许在末尾追加，永不改写历史版本。
 MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (1, "initial_schema", _migrate_1_initial_schema),
@@ -230,6 +276,7 @@ MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (3, "audit_events_append_only", _migrate_3_audit_append_only),
     (4, "record_freezes", _migrate_4_record_freezes),
     (5, "sensitive_phrases", _migrate_5_sensitive_phrases),
+    (6, "snapshot_read_windows", _migrate_6_snapshot_read_windows),
 )
 
 TARGET_SCHEMA_VERSION = MIGRATIONS[-1][0]

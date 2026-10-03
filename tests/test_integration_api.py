@@ -3554,5 +3554,462 @@ class SensitivePhraseIntegrationTests(unittest.TestCase):
         self.assertEqual(r.status_code, 201, r.text)
 
 
+@unittest.skipIf(SKIP_INTEGRATION, _SKIP_REASON)
+class ReadWindowIntegrationTests(unittest.TestCase):
+    """快照统一外部阅览时段：设置/冻结/继承/冲突、公开读取窗口判定与维护侧查询。"""
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+
+    def setUp(self):
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": TEXT_V1, "intervals": INTERVALS_V1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        self.record_id = r.json()["record_id"]
+
+    # ---- 工具方法 ----
+
+    @staticmethod
+    def _iso(dt):
+        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _parse(text):
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+    def _publish(self, version=1, extra=None, expected=201, record_id=None):
+        body = {"version": version}
+        if extra:
+            body.update(extra)
+        r = self.client.post(
+            f"/records/{record_id or self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json=body,
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _read(self, snapshot_id, token):
+        return self.client.get(f"/public/snapshots/{snapshot_id}?token={token}")
+
+    def _mark_controlled(self):
+        r = self.client.put(
+            f"/records/{self.record_id}/controlled", headers=SERVICE_HEADERS
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def _submit(self, auth=BASIC_ALICE, version=1, extra=None, expected=201):
+        body = {"version": version}
+        if extra:
+            body.update(extra)
+        r = self.client.post(
+            f"/records/{self.record_id}/publish-requests", auth=auth, json=body
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _snapshots_of_record(self, record_id=None):
+        r = self.client.get(
+            f"/records/{record_id or self.record_id}", headers=SERVICE_HEADERS
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["snapshots"]
+
+    def _audit_events(self, snapshot_id):
+        r = self.client.get(
+            f"/snapshots/{snapshot_id}/read-events",
+            headers=SERVICE_HEADERS,
+            params={"start": "2000-01-01T00:00:00Z", "end": "2100-01-01T00:00:00Z"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["events"]
+
+    def _window(self, opens_delta_hours=-1, closes_delta_hours=1):
+        now = datetime.now(timezone.utc)
+        from datetime import timedelta
+
+        return {
+            "opens_at": self._iso(now + timedelta(hours=opens_delta_hours)),
+            "closes_at": self._iso(now + timedelta(hours=closes_delta_hours)),
+        }
+
+    # ---- 兼容：不带时段的既有行为不变 ----
+
+    def test_publish_without_window_keeps_legacy_behavior(self):
+        pub = self._publish().json()
+        self.assertIsNone(pub["opens_at"])
+        self.assertIsNone(pub["closes_at"])
+        r = self._read(pub["snapshot_id"], pub["token"])
+        self.assertEqual(r.status_code, 200, r.text)
+        # 公开成功响应结构不变：不携带时段字段
+        self.assertNotIn("opens_at", r.json())
+        self.assertNotIn("closes_at", r.json())
+        # 维护侧查询返回时段字段（无时段限制时为 null）
+        snapshots = self._snapshots_of_record()
+        self.assertEqual(len(snapshots), 1)
+        self.assertIsNone(snapshots[0]["opens_at"])
+        self.assertIsNone(snapshots[0]["closes_at"])
+
+    # ---- 设置时段与维护侧查询 ----
+
+    def test_publish_with_window_reads_within_window(self):
+        window = self._window()
+        pub = self._publish(extra=window).json()
+        # 发布响应回显生效时段（与设置同一时刻）
+        self.assertEqual(self._parse(pub["opens_at"]), self._parse(window["opens_at"]))
+        self.assertEqual(self._parse(pub["closes_at"]), self._parse(window["closes_at"]))
+        r = self._read(pub["snapshot_id"], pub["token"])
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotIn("opens_at", r.json())
+        # 维护侧记录查询返回快照时段
+        snapshots = self._snapshots_of_record()
+        self.assertEqual(self._parse(snapshots[0]["opens_at"]), self._parse(window["opens_at"]))
+        self.assertEqual(
+            self._parse(snapshots[0]["closes_at"]), self._parse(window["closes_at"])
+        )
+
+    def test_window_validation_rejects_malformed_requests(self):
+        now = datetime.now(timezone.utc)
+        from datetime import timedelta
+
+        future = self._iso(now + timedelta(hours=1))
+        later = self._iso(now + timedelta(hours=2))
+        past = self._iso(now - timedelta(hours=1))
+        # 只填一个 -> 422
+        self._publish(extra={"opens_at": past}, expected=422)
+        self._publish(extra={"closes_at": future}, expected=422)
+        # 开放不早于截止 -> 422
+        self._publish(extra={"opens_at": future, "closes_at": future}, expected=422)
+        self._publish(extra={"opens_at": later, "closes_at": future}, expected=422)
+        # 提交时截止已到 -> 422
+        self._publish(extra={"opens_at": past, "closes_at": past}, expected=422)
+        # 全部拒绝后不产生快照
+        self.assertEqual(self._snapshots_of_record(), [])
+        # naive 时间按 UTC 处理：合法窗口可正常发布
+        naive_window = {
+            "opens_at": (now - timedelta(hours=1)).replace(tzinfo=None).isoformat(),
+            "closes_at": (now + timedelta(hours=1)).replace(tzinfo=None).isoformat(),
+        }
+        pub = self._publish(extra=naive_window).json()
+        self.assertIsNotNone(pub["opens_at"])
+        self.assertEqual(self._read(pub["snapshot_id"], pub["token"]).status_code, 200)
+
+    # ---- 公开读取窗口判定 ----
+
+    def test_read_before_open_403_without_count_or_audit(self):
+        pub = self._publish(extra={**self._window(1, 2), "max_reads": 3}).json()
+        r = self._read(pub["snapshot_id"], pub["token"])
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["detail"], "snapshot unavailable")
+        # 不扣次数
+        token_status = self.client.get(
+            f"/tokens/{pub['token']}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(token_status["reads_used"], 0)
+        self.assertEqual(token_status["remaining_reads"], 3)
+        # 不记成功审计
+        self.assertEqual(self._audit_events(pub["snapshot_id"]), [])
+
+    def test_read_after_close_403_without_count_or_audit(self):
+        import time as _time
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        window = {
+            "opens_at": self._iso(now - timedelta(hours=1)),
+            "closes_at": self._iso(now + timedelta(seconds=1.5)),
+        }
+        pub = self._publish(extra={**window, "max_reads": 5}).json()
+        # 窗口内读取成功（消耗一次并写审计）
+        self.assertEqual(self._read(pub["snapshot_id"], pub["token"]).status_code, 200)
+        _time.sleep(2.0)
+        # 截止后：模糊 403，不扣次数、不写审计
+        r = self._read(pub["snapshot_id"], pub["token"])
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["detail"], "snapshot unavailable")
+        token_status = self.client.get(
+            f"/tokens/{pub['token']}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(token_status["reads_used"], 1)
+        self.assertEqual(len(self._audit_events(pub["snapshot_id"])), 1)
+
+    # ---- 同一版本只保留首次发布的时段 ----
+
+    def test_republish_omitting_window_inherits_first_setting(self):
+        window = self._window()
+        first = self._publish(extra=window).json()
+        # 后续签发省略时段：沿用首次设置
+        second = self._publish().json()
+        self.assertEqual(second["snapshot_id"], first["snapshot_id"])
+        self.assertEqual(self._parse(second["opens_at"]), self._parse(window["opens_at"]))
+        self.assertEqual(
+            self._parse(second["closes_at"]), self._parse(window["closes_at"])
+        )
+        # 快照时段未被改写
+        snapshots = self._snapshots_of_record()
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(self._parse(snapshots[0]["opens_at"]), self._parse(window["opens_at"]))
+        # 新令牌在窗口内可读
+        self.assertEqual(self._read(first["snapshot_id"], second["token"]).status_code, 200)
+
+    def test_republish_with_same_window_succeeds_even_in_other_timezone(self):
+        from datetime import timedelta
+
+        window = self._window()
+        self._publish(extra=window)
+        # 同一时刻的不同时区写法不算冲突
+        plus8 = timezone(timedelta(hours=8))
+        same_window = {
+            "opens_at": self._parse(window["opens_at"]).astimezone(plus8).isoformat(),
+            "closes_at": self._parse(window["closes_at"]).astimezone(plus8).isoformat(),
+        }
+        r = self._publish(extra=same_window)
+        self.assertEqual(r.status_code, 201, r.text)
+
+    def test_republish_with_different_window_conflicts_and_never_rewrites(self):
+        first_window = self._window()
+        first = self._publish(extra=first_window).json()
+        # 显式填写不同时段 -> 409，快照不被改写
+        r = self._publish(extra=self._window(-2, 2), expected=409)
+        self.assertIn("different read window", r.json()["detail"])
+        snapshots = self._snapshots_of_record()
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(
+            self._parse(snapshots[0]["opens_at"]), self._parse(first_window["opens_at"])
+        )
+        # 首次未设时段的版本：后续显式填写时段同样冲突（不能补写）
+        r = self.client.put(
+            f"/records/{self.record_id}",
+            headers=SERVICE_HEADERS,
+            json={"base_version": 1, "text": TEXT_V2, "intervals": [{"start": 9, "end": 15}]},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self._publish(version=2)  # 无时段
+        self._publish(version=2, extra=self._window(), expected=409)
+        # 两个版本的无时段/有时段快照都保持原样
+        self.assertEqual(len(self._snapshots_of_record()), 2)
+        self.assertEqual(self._read(first["snapshot_id"], first["token"]).status_code, 200)
+
+    # ---- 受控发布：申请冻结时段 ----
+
+    def test_controlled_submit_freezes_window_and_approve_issues(self):
+        self._mark_controlled()
+        window = self._window()
+        # 提交时校验：只填一个 / 开放不早于截止 / 截止已到 -> 422，不产生申请
+        self._submit(extra={"opens_at": window["opens_at"]}, expected=422)
+        self._submit(
+            extra={"opens_at": window["closes_at"], "closes_at": window["opens_at"]},
+            expected=422,
+        )
+        past = self._window(-2, -1)
+        self._submit(extra=past, expected=422)
+        # 正常提交：时段随申请冻结
+        request_id = self._submit(extra=window).json()["request_id"]
+        info = self.client.get(f"/publish-requests/{request_id}", auth=BASIC_ALICE).json()
+        self.assertEqual(self._parse(info["opens_at"]), self._parse(window["opens_at"]))
+        self.assertEqual(self._parse(info["closes_at"]), self._parse(window["closes_at"]))
+        # 批准：签发响应与维护侧查询均可见生效时段
+        approved = self.client.post(
+            f"/publish-requests/{request_id}/approve", auth=BASIC_BOB
+        ).json()
+        self.assertEqual(self._parse(approved["opens_at"]), self._parse(window["opens_at"]))
+        r = self._read(approved["snapshot_id"], approved["token"])
+        self.assertEqual(r.status_code, 200, r.text)
+        snapshots = self._snapshots_of_record()
+        self.assertEqual(self._parse(snapshots[0]["closes_at"]), self._parse(window["closes_at"]))
+
+    def test_controlled_approve_after_window_closed_422_stays_pending_and_rejectable(self):
+        import time as _time
+        from datetime import timedelta
+
+        self._mark_controlled()
+        now = datetime.now(timezone.utc)
+        window = {
+            "opens_at": self._iso(now - timedelta(hours=1)),
+            "closes_at": self._iso(now + timedelta(seconds=1.5)),
+        }
+        request_id = self._submit(extra=window).json()["request_id"]
+        _time.sleep(2.0)
+        # 批准时截止已到：拒绝批准，申请仍待审
+        r = self.client.post(f"/publish-requests/{request_id}/approve", auth=BASIC_BOB)
+        self.assertEqual(r.status_code, 422, r.text)
+        info = self.client.get(f"/publish-requests/{request_id}", auth=BASIC_BOB).json()
+        self.assertEqual(info["status"], "pending")
+        # 不产生快照
+        self.assertEqual(self._snapshots_of_record(), [])
+        # 仍可驳回（终态）
+        r = self.client.post(
+            f"/publish-requests/{request_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "时段已过"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "rejected")
+
+    def test_controlled_approve_conflicting_window_409_stays_pending(self):
+        self._mark_controlled()
+        first_window = self._window()
+        req_a = self._submit(extra=first_window).json()["request_id"]
+        req_b = self._submit(extra=self._window(-2, 2)).json()["request_id"]
+        # A 先批准：快照时段固定为 A 的冻结时段
+        approved = self.client.post(
+            f"/publish-requests/{req_a}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(approved.status_code, 200, approved.text)
+        # B 的冻结时段与首次设置不同：批准冲突，申请保持待审、可驳回
+        r = self.client.post(f"/publish-requests/{req_b}/approve", auth=BASIC_BOB)
+        self.assertEqual(r.status_code, 409, r.text)
+        info = self.client.get(f"/publish-requests/{req_b}", auth=BASIC_BOB).json()
+        self.assertEqual(info["status"], "pending")
+        r = self.client.post(f"/publish-requests/{req_b}/reject", auth=BASIC_BOB, json={})
+        self.assertEqual(r.status_code, 200, r.text)
+        # 快照时段未被改写
+        snapshots = self._snapshots_of_record()
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(
+            self._parse(snapshots[0]["opens_at"]), self._parse(first_window["opens_at"])
+        )
+
+    def test_controlled_submit_and_approve_against_existing_snapshot_window(self):
+        self._mark_controlled()
+        window = self._window()
+        req_a = self._submit(extra=window).json()["request_id"]
+        approved = self.client.post(
+            f"/publish-requests/{req_a}/approve", auth=BASIC_BOB
+        ).json()
+        # 已有快照后：显式填写不同时段的申请在提交时即冲突
+        self._submit(extra=self._window(-2, 2), expected=409)
+        # 省略时段的申请：批准时沿用首次设置
+        req_b = self._submit().json()["request_id"]
+        approved_b = self.client.post(
+            f"/publish-requests/{req_b}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(approved_b.status_code, 200, approved_b.text)
+        self.assertEqual(
+            self._parse(approved_b.json()["opens_at"]), self._parse(window["opens_at"])
+        )
+        self.assertEqual(
+            self._read(approved["snapshot_id"], approved_b.json()["token"]).status_code,
+            200,
+        )
+
+    # ---- 共享凭证与其他阻断规则 ----
+
+    def test_window_applies_to_bundle_credential_without_consuming_quota(self):
+        # 本记录的快照：窗口尚未开放
+        closed_pub = self._publish(extra=self._window(1, 2)).json()
+        # 另一条记录的快照：无时段限制
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": "另一条记录，内容A。", "intervals": [{"start": 0, "end": 3}]},
+        )
+        other_record = r.json()["record_id"]
+        open_pub = self._publish(record_id=other_record).json()
+        # 共享凭证覆盖两个快照
+        bundle_req = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_ALICE,
+            json={
+                "snapshot_ids": [closed_pub["snapshot_id"], open_pub["snapshot_id"]],
+                "max_reads": 5,
+            },
+        )
+        self.assertEqual(bundle_req.status_code, 201, bundle_req.text)
+        bundle_id = bundle_req.json()["request_id"]
+        approved = self.client.post(
+            f"/bundle-requests/{bundle_id}/approve", auth=BASIC_BOB
+        ).json()
+        credential = approved["credential"]
+        # 窗口外的快照：共享凭证与单快照令牌均模糊 403，不扣额度
+        r = self._read(closed_pub["snapshot_id"], credential)
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["detail"], "snapshot unavailable")
+        self.assertEqual(self._read(closed_pub["snapshot_id"], closed_pub["token"]).status_code, 403)
+        # 清单内其他快照不受影响，正常读取并扣共享额度
+        self.assertEqual(self._read(open_pub["snapshot_id"], credential).status_code, 200)
+        bundle_status = self.client.get(
+            f"/read-bundles/{approved['bundle_id']}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(bundle_status["reads_used"], 1)
+        self.assertEqual(bundle_status["remaining_reads"], 4)
+        # 窗口外读取不写审计；另一条记录有一次成功读取事件
+        self.assertEqual(self._audit_events(closed_pub["snapshot_id"]), [])
+        self.assertEqual(len(self._audit_events(open_pub["snapshot_id"])), 1)
+
+    def test_freeze_and_withdraw_still_block_windowed_snapshot(self):
+        pub = self._publish(extra=self._window()).json()
+        self.assertEqual(self._read(pub["snapshot_id"], pub["token"]).status_code, 200)
+        # 冻结：窗口内仍按原规则阻断，不扣次数
+        r = self.client.post(
+            f"/records/{self.record_id}/freeze",
+            headers=SERVICE_HEADERS,
+            json={"reason": "临时阻断"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._read(pub["snapshot_id"], pub["token"]).status_code, 403)
+        # 解除冻结：窗口内恢复可读
+        r = self.client.post(
+            f"/records/{self.record_id}/unfreeze", headers=SERVICE_HEADERS
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._read(pub["snapshot_id"], pub["token"]).status_code, 200)
+        # 撤回：窗口内同样永久阻断
+        r = self.client.post(
+            f"/snapshots/{pub['snapshot_id']}/withdraw",
+            headers=SERVICE_HEADERS,
+            json={"reason": "不再公开"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._read(pub["snapshot_id"], pub["token"]).status_code, 403)
+
+    def test_concurrent_publish_with_different_windows_sets_window_exactly_once(self):
+        # 并发首发同一版本且时段不同：恰好一个 201（其时段定版），其余 409；
+        # 快照只有一份且时段与胜者一致，绝不出现两份或混合时段。
+        window_a = self._window(-1, 1)
+        window_b = self._window(-2, 2)
+        outcomes = []
+        barrier = threading.Barrier(2)
+
+        def publish(window):
+            barrier.wait()
+            r = self.client.post(
+                f"/records/{self.record_id}/publish",
+                headers=SERVICE_HEADERS,
+                json={"version": 1, **window},
+            )
+            outcomes.append((r.status_code, r.json()))
+
+        threads = [
+            threading.Thread(target=publish, args=(window_a,)),
+            threading.Thread(target=publish, args=(window_b,)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        codes = sorted(code for code, _ in outcomes)
+        self.assertEqual(codes, [201, 409], outcomes)
+        winner = next(body for code, body in outcomes if code == 201)
+        snapshots = self._snapshots_of_record()
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0]["opens_at"], winner["opens_at"])
+        self.assertEqual(snapshots[0]["closes_at"], winner["closes_at"])
+        # 后续省略时段的签发沿用胜者定版的时段
+        again = self._publish().json()
+        self.assertEqual(again["opens_at"], winner["opens_at"])
+
+
 if __name__ == "__main__":
     unittest.main()
