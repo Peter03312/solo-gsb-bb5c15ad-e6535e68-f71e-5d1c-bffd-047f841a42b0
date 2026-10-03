@@ -1,0 +1,47 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: redact
+      POSTGRES_PASSWORD: redact
+      POSTGRES_DB: redact
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U redact -d redact"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg2://redact:redact@db:5432/redact
+      # 演示用密钥，生产环境务必修改
+      SERVICE_KEY: dev-service-key-change-me
+      # 受控发布操作者凭据（演示值，生产环境务必修改）：
+      # alice 只能申请，bob 只能复核，carol 兼具两种角色
+      REVIEW_CREDENTIALS: >-
+        [{"username":"alice","password":"alice-pw","roles":["operator"]},
+         {"username":"bob","password":"bob-pw","roles":["reviewer"]},
+         {"username":"carol","password":"carol-pw","roles":["operator","reviewer"]}]
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    # 升级未完成/失败或版本不匹配时，除 /livez 外的路径一律 503；
+    # 就绪探针只在升级完成且版本核对通过后变绿，编排系统据此决定是否放入流量。
+    # 复用同一数据卷扩容多个副本时，咨询锁保证仅一个副本执行升级，其余等待核对。
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/readyz').status==200 else 1)\""]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
