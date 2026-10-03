@@ -49,8 +49,9 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 | 3 | `audit_events_append_only` | 审计事件防改写约束：触发器拒绝任何 `UPDATE`/`DELETE`/`TRUNCATE` |
 | 4 | `record_freezes` | 记录临时冻结表 `record_freezes` 与“每条记录至多一个当前冻结期”的部分唯一索引；只新增结构，既有记录默认未冻结、全部快照继续按既有资格可读 |
 | 5 | `sensitive_phrases` | 敏感短语清单单行配置表 `sensitive_phrase_settings` 与初始“停用核验”行（空清单、版本 1）；只新增结构，既有发布/读取语义不变 |
+| 6 | `snapshot_windows` | 快照外部阅览时段：`snapshots` 与 `publish_requests` 各增 `window_open_at`/`window_close_at`（带时区、可空）及“成对出现、开放早于截止”CHECK；既有行两列均为 `NULL`（无时段限制），发布/批准/公开读取语义完全不变 |
 
-代码支持的最高版本为 5（`/readyz` 的 `supported_schema_version`）。**后续新增变更只能在升级链末尾追加新版本，不得改写历史版本。**
+代码支持的最高版本为 6（`/readyz` 的 `supported_schema_version`）。**后续新增变更只能在升级链末尾追加新版本，不得改写历史版本。**
 
 ### 升级流程与保证
 
@@ -59,8 +60,8 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 1. **等待数据库就绪**（按 `DB_CONNECT_RETRIES` / `DB_CONNECT_RETRY_DELAY_SECONDS` 重试）；
 2. 获取一把固定键的 **PostgreSQL 会话级咨询锁**（`pg_advisory_lock`）：多个实例同时启动时，**只有一个实例（领导者）进入升级**，其余实例在锁上排队等待；
 3. 判定起点：
-   - **空库**（无任何业务表）：从 v1 开始依次建表、补齐、安装防改写触发器、建冻结表、建敏感短语配置表；
-   - **升级框架出现前的旧库**（有业务表但无 `schema_migrations`）：把既有结构**补登为 v1 基线**（不重放建表、不重写数据），再增量执行 v2、v3、v4、v5；
+   - **空库**（无任何业务表）：从 v1 开始依次建表、补齐、安装防改写触发器、建冻结表、建敏感短语配置表、补快照时段列与约束；
+   - **升级框架出现前的旧库**（有业务表但无 `schema_migrations`）：把既有结构**补登为 v1 基线**（不重放建表、不重写数据），再增量执行 v2、v3、v4、v5、v6；
    - **已升级库**：只核对版本，不执行任何变更语句；
 4. **每个版本独立事务**：升级语句、数据回填与该版本记录原子提交；任一语句失败则整个版本回滚且**不登记**，修复后重启可从失败版本安全重试；
 5. 升级完成后核对库版本必须等于代码支持版本，然后释放咨询锁；排队的其余实例拿到锁后看到已是目标版本，仅做核对即放行。
@@ -88,7 +89,7 @@ docker compose up --build -d
 
 # 3) 等待该实例就绪（返回 200 且 schema_version 为目标版本）
 curl -fsS http://localhost:8000/readyz
-# => {"status":"ready","schema_version":5,"supported_schema_version":5}
+# => {"status":"ready","schema_version":6,"supported_schema_version":6}
 
 # 4) 核对升级记录
 docker compose exec db psql -U redact -d redact \
@@ -161,8 +162,8 @@ WHERE tgrelid = 'read_audit_events'::regclass AND tgname LIKE 'trg_read_audit_ev
 | `POST` | `/records` | 服务密钥 | 创建记录（版本 1），提交原文与敏感区间 |
 | `PUT` | `/records/{record_id}` | 服务密钥 | 修订：携带 `base_version`，过期返回 `409` 与当前版本 |
 | `PUT` | `/records/{record_id}/controlled` | 服务密钥 | 将记录设为受控发布（幂等） |
-| `POST` | `/records/{record_id}/publish` | 服务密钥 | 直接发布指定版本（可带 `max_reads` 上限）；**受控记录一律 `409` 拒绝** |
-| `POST` | `/records/{record_id}/publish-requests` | operator | 提交受控发布申请（冻结指定历史版本内容与 `max_reads`） |
+| `POST` | `/records/{record_id}/publish` | 服务密钥 | 直接发布指定版本（可带 `max_reads` 上限与外部阅览时段 `window_open_at`/`window_close_at`）；**受控记录一律 `409` 拒绝** |
+| `POST` | `/records/{record_id}/publish-requests` | operator | 提交受控发布申请（冻结指定历史版本内容、`max_reads` 与外部阅览时段） |
 | `POST` | `/publish-requests/{request_id}/approve` | reviewer（非申请人） | 批准：同事务生成快照 + 新读取令牌（冻结的上限生效） |
 | `POST` | `/publish-requests/{request_id}/reject` | reviewer（非申请人） | 驳回（可带 `reason`），驳回为终态，不生成令牌或计数 |
 | `GET` | `/publish-requests/{request_id}` | 任一已认证操作者 | 查询单个申请状态（含冻结的 `token_max_reads`，不含原文） |
@@ -170,7 +171,7 @@ WHERE tgrelid = 'read_audit_events'::regclass AND tgname LIKE 'trg_read_audit_ev
 | `GET` | `/tokens/{token}` | 服务密钥 | 查询令牌状态：上限 `max_reads`、已用 `reads_used`、剩余 `remaining_reads`（不含原文） |
 | `POST` | `/tokens/{token}/revoke` | 服务密钥 | 撤销读取令牌（含受控发布签发的令牌） |
 | `POST` | `/snapshots/{snapshot_id}/withdraw` | 服务密钥 | **永久撤回快照**（首次需带 `reason`）；重复撤回返回首次撤回时间与状态 |
-| `GET` | `/records/{record_id}` | 服务密钥 | 查看当前版本、受控标记与快照列表（含撤回时间、原因与状态） |
+| `GET` | `/records/{record_id}` | 服务密钥 | 查看当前版本、受控标记与快照列表（含撤回时间、原因、状态与外部阅览时段） |
 | `POST` | `/records/{record_id}/freeze` | 服务密钥 | **临时冻结记录**（首次需非空白 `reason`）：覆盖现有及期间新发布的全部快照；重复冻结幂等、不覆盖原因/开始时间 |
 | `GET` | `/records/{record_id}/freeze` | 服务密钥 | 查询当前冻结状态（当前冻结期开始时间、原因；未冻结时各字段为 null） |
 | `POST` | `/records/{record_id}/unfreeze` | 服务密钥 | **解除冻结**（幂等）：只恢复原本仍有效的读取资格，不复活失效凭证/额度/已撤回快照 |
@@ -247,7 +248,8 @@ curl -sS -X PUT http://localhost:8000/records/<RID> \
 # => {"record_id":"<RID>","version":2}
 # 过期时 => 409 {"detail":{"message":"base_version is stale","current_version":2}}
 
-# 3. 发布版本 2（可另加 "expires_in_seconds": 3600、"expires_at": "2026-10-01T00:00:00Z"、"max_reads": 5）
+# 3. 发布版本 2（可另加 "expires_in_seconds": 3600、"expires_at": "2026-10-01T00:00:00Z"、"max_reads": 5，
+#    或外部阅览时段 "window_open_at": "2026-10-03T08:00:00Z"、"window_close_at": "2026-10-03T18:00:00Z"，两者须成对）
 curl -sS -X POST http://localhost:8000/records/<RID>/publish \
   -H "X-Service-Key: dev-service-key-change-me" \
   -H "Content-Type: application/json" \
@@ -365,6 +367,81 @@ curl -sS "http://localhost:8000/public/snapshots/<SID>?token=<TOKEN>"
 ./examples/demo_freeze.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW 覆盖
 ```
 
+## 快照外部阅览时段（统一开放窗口）
+
+机构可为每个**记录版本的快照**设定统一的外部阅览时段：直接发布或提交受控发布申请时，可随版本填写带时区的开放与截止时刻。时段是**快照属性**（不是令牌/凭证属性），对单快照令牌与多快照共享凭证一视同仁。
+
+### 接口与规则
+
+- **请求字段**：`window_open_at` 与 `window_close_at`，均为 ISO 8601 时刻（推荐带 `Z` 或 `+08:00` 偏移；不带偏移的 naive 时刻按 UTC 处理）。
+  - 两者**必须同时填写或同时省略**；开放时刻必须**早于**截止时刻，否则请求层 `422`。
+  - 提交时（直接发布 / 提交受控申请）截止时刻**已到**（`close <= now`）→ `422 window_close_at must be in the future`，整次拒绝；开放时刻允许落在过去（表示“立即开放”）。
+  - 均省略 = 本次签发不携带时段：快照首次发布未带时段则**无时段限制**（既有不带时段的请求完全兼容）；快照已有首次时段则**沿用**首次设置。
+- **首次发布固定、不可改写**：同一 `(record_id, version)` 只保留**首次发布**的时段。后续签发（直接发布或受控批准复用同版本快照）：
+  - 省略时段 → 沿用首次设置（首次也未带则继续无限制）；
+  - 显式填写与首次**完全相同**的时段（按绝对时刻比较，不同时区表达等价）→ 幂等放行；
+  - 显式填写**不同**设置 → `409` 冲突拒绝，**绝不改写快照**（含“无窗口快照想补设窗口”）。
+- **受控申请冻结**：时段在提交申请时随申请冻结（申请详情以 `window_open_at`/`window_close_at` 返回），复核耗时与后续修订不改变它。批准时：
+  - 冻结时段的**截止已到** → `409` 拒绝批准，**不产生快照/令牌**，申请**保持待审、仍可驳回**；
+  - 申请时段与同版本快照首次发布已有时段**不一致** → `409` 整次批准失败，申请保持待审、仍可驳回；
+  - 申请未带时段 → 沿用快照既有时段（首次设置或仍为无限制）。
+- **公开读取判定**：带时段的快照仅在 **`[window_open_at, window_close_at)`** 内可公开读取——开放时刻起**含**、截止时刻前**不含**，一律以**服务端资格判定时刻**为准（客户端时钟不参与）。
+  - 窗口外（开放前 / 截止后）对**单快照令牌与共享凭证**均沿用既有模糊 `403 {"detail":"snapshot unavailable"}`，不区分原因；
+  - 窗口外请求**不扣次数**（令牌计数与共享额度都不消耗）、**不写成功读取审计**；
+  - 时段按**单个快照**判定：同一条共享凭证清单内其他快照不受影响，窗口外快照的 403 不消耗共享额度；
+  - 无时段快照（维护侧两字段均为 `null`）恒通过时段检查。
+- **与既有阻断的关系**：撤回、记录临时冻结及凭证失效（撤销、到期、换发、额度耗尽、不在清单）仍按原规则阻断；这些检查与时段检查在同一加锁流程内依次进行，任一不通过都是同样的模糊 403，均不扣次、不审计。
+- **维护侧可见**：`GET /records/{record_id}` 的每个快照条目含 `window_open_at` / `window_close_at`（均为 `null` 表示无时段限制）；直接发布与批准响应也回显生效中的时段。**公开成功响应结构不变**（不含时段字段），公开侧 403 不透露窗口信息。
+- **状态码**：字段成对/顺序非法、截止已到（提交时）→ `422`；与快照既有时段冲突、批准时截止已到 → `409`；窗口外公开读取 → 模糊 `403`；鉴权约定（服务密钥 / HTTP Basic）不变。
+
+### 调用示例
+
+```bash
+# 1. 直接发布时携带时段（开放可在过去；截止必须晚于当前）
+curl -sS -X POST http://localhost:8000/records/<RID>/publish \
+  -H "X-Service-Key: dev-service-key-change-me" -H "Content-Type: application/json" \
+  -d '{"version":1,"max_reads":5,
+       "window_open_at":"2026-10-03T08:00:00Z",
+       "window_close_at":"2026-10-03T18:00:00+08:00"}'
+# => 201 {"snapshot_id":"<SID>","token":"<TOKEN>","max_reads":5,
+#         "window_open_at":"2026-10-03T08:00:00Z",
+#         "window_close_at":"2026-10-03T10:00:00Z", ...}   # 服务端统一回显为 UTC
+
+# 2. 窗口内公开读取：200；开放前/截止后：403 snapshot unavailable（不扣次、不审计）
+curl -sS "http://localhost:8000/public/snapshots/<SID>?token=<TOKEN>"
+# => 200 {"record_id":"<RID>","version":1,"status":"published","redacted_text":"……"}
+#    （公开成功响应结构不变，不含时段字段）
+# 截止后 => 403 {"detail":"snapshot unavailable"}
+
+# 3. 同版本再次签发：省略时段沿用首次设置
+curl -sS -X POST http://localhost:8000/records/<RID>/publish \
+  -H "X-Service-Key: dev-service-key-change-me" -H "Content-Type: application/json" \
+  -d '{"version":1}'
+# => 201 {"snapshot_id":"<同一 SID>","token":"<新 TOKEN>",
+#         "window_open_at":"<首次设置>","window_close_at":"<首次设置>"}
+# 显式不同设置 => 409 {"detail":{"message":"snapshot reading window is fixed at its first publish and cannot be changed",
+#                                "window_open_at":"…","window_close_at":"…"}}
+
+# 4. 维护侧查询返回快照时段
+curl -sS http://localhost:8000/records/<RID> -H "X-Service-Key: dev-service-key-change-me"
+# => {"snapshots":[{"version":1,"status":"published",
+#                   "window_open_at":"…","window_close_at":"…", ...}], ...}
+
+# 5. 受控申请冻结时段（operator 提交；字段成对、开放早于截止、截止未到）
+curl -sS -X POST http://localhost:8000/records/<RID>/publish-requests \
+  -u alice:<ALICE_PW> -H "Content-Type: application/json" \
+  -d '{"version":1,"window_open_at":"2026-10-03T08:00:00Z","window_close_at":"2026-10-04T00:00:00Z"}'
+# => 201 {"request_id":"<PRID>","status":"pending","window_open_at":"…","window_close_at":"…", ...}
+# 批准时截止已到 => 409（申请仍 pending，可 POST /publish-requests/<PRID>/reject 驳回）；
+# 申请时段与快照首次时段不一致 => 409（不改写快照，仍可驳回）。
+```
+
+完整外部阅览时段演示（含窗口边界、422/409、沿用/幂等/冲突、受控截止后拒批仍可驳回、共享凭证逐快照判定不扣共享额度）：
+
+```bash
+./examples/demo_windows.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW 覆盖
+```
+
 ## 敏感短语清单（发布前字面量命中核验）
 
 机构维护人员可维护一份**当前启用的敏感短语清单**，让服务在发布前对拟公开内容做最后一道核验：拟发布版本原文中的每个敏感短语命中，都必须已被提交的遮蔽区间**完整覆盖**，否则拒绝发布。
@@ -474,12 +551,12 @@ curl -sS "$BASE/public/snapshots/<SID>?token=<TOKEN>"
 ### 语义与规则
 
 1. **标记受控**：机构凭服务密钥 `PUT /records/{id}/controlled`（幂等）。受控记录的直接发布请求返回 `409`；非受控记录的受控申请同样返回 `409`（引导使用正确入口）。
-2. **提交申请**：具备 `operator` 角色者用**本人凭据** `POST /records/{id}/publish-requests`，指定一个**历史版本**（`version`，可带 `expires_in_seconds`/`expires_at` 与可选正整数 `max_reads`，规则与直接发布一致）。申请在提交时**冻结该版本的原文与敏感区间，以及读取次数上限**，后续修订只产生新版本，不改变待审内容与上限。
+2. **提交申请**：具备 `operator` 角色者用**本人凭据** `POST /records/{id}/publish-requests`，指定一个**历史版本**（`version`，可带 `expires_in_seconds`/`expires_at`、可选正整数 `max_reads` 与可选外部阅览时段 `window_open_at`/`window_close_at`，规则与直接发布一致）。申请在提交时**冻结该版本的原文与敏感区间、读取次数上限与外部阅览时段**，后续修订只产生新版本，不改变待审内容、上限与时段。
 3. **复核**：具备 `reviewer` 角色的**另一人**批准或驳回：
    - **申请人不得复核**自己的申请（即使其同时拥有 reviewer 角色）→ `403`；
    - 批准与驳回互斥：驳回后不能批准、批准后不能再驳回；对已终结申请再次操作 → `409`；
    - 并发复核由数据库行锁串行化，**同一申请只会产生一个终态**，落选方收到 `409`。
-4. **批准事务**：沿用既有脱敏（合并相交/相邻区间→`[已遮蔽]`）与令牌（`secrets.token_urlsafe(32)`、可选到期）规则，在**同一事务**内生成不可变快照、写入新读取令牌（携带申请时冻结的 `max_reads`）并终结申请；任何一步失败整体回滚，**不会留下可读令牌或计数**。
+4. **批准事务**：沿用既有脱敏（合并相交/相邻区间→`[已遮蔽]`）与令牌（`secrets.token_urlsafe(32)`、可选到期）规则，在**同一事务**内生成不可变快照、写入新读取令牌（携带申请时冻结的 `max_reads`）并终结申请；任何一步失败整体回滚，**不会留下可读令牌或计数**。冻结时段**截止已到**（`409`，申请仍待审、可驳回）或与同版本快照首次发布时段**不一致**（`409`，不改写快照、仍可驳回）时不批准；申请未带时段则沿用快照既有时段。详见“快照外部阅览时段”一节。
 5. **驳回**：只终结申请（可记录 `reason`），不生成快照、令牌或读取计数。
 6. **拒绝不泄露原文**：无凭据/凭据错误 → `401`，无角色 → `403`，未知记录/版本/申请 → `404`，已终结/入口错误 → `409`；申请查询只返回元数据（含 `token_max_reads`），冻结原文绝不离开服务端。
 7. 批准签发的令牌与直接发布令牌完全一致：遵守 `max_reads` 次数上限与到期规则，可用 `POST /tokens/{token}/revoke` 撤销，可用 `GET /tokens/{token}` 查询已用/剩余次数。
@@ -846,7 +923,7 @@ KEY=dev-service-key-change-me
 
 # 1) 探针：就绪后才放流量；livez 在升级失败时仍可探活
 curl -fsS "$BASE/readyz"
-# => {"status":"ready","schema_version":5,"supported_schema_version":5}
+# => {"status":"ready","schema_version":6,"supported_schema_version":6}
 curl -s  "$BASE/livez"
 # => {"status":"alive","upgrade_status":"ready"}
 # 升级未就绪/失败时，除 /livez 外一律：
@@ -913,6 +990,11 @@ curl -s -H "X-Service-Key: $KEY" "$BASE/records/<RID>/freeze"
   - 冻结先 `SELECT ... FOR UPDATE` 锁记录行再核对/插入冻结行，重复冻结在记录锁内读到当前冻结期即幂等回放（`already_frozen=true`），并发冻结由记录行锁与部分唯一索引串行化，恰好一个首次结果；解除是一条原子条件 `UPDATE ... WHERE unfrozen_at IS NULL`，重复解除返回 `already_unfrozen=true`；
   - 公开读取在快照行锁（撤回判定）之后**再锁记录行**并在锁内以 `FOR UPDATE` 核对当前冻结期，锁序恒为“快照行 → 记录行 → 冻结行”，与冻结/换发事务同序，**串行化而不死锁**；命中冻结期即在任何计数 `UPDATE` 与审计写入之前返回模糊 `403`，**不扣次数、不写成功读取审计**，公开响应不透露冻结或原因；
   - 冻结按记录生效：覆盖该记录现有及冻结期间新发布的全部快照，却不影响共享凭证中**其他记录**的读取，也不撤销或改动任何凭证；解除不重置计数、不改凭证状态——已撤回快照、过期/撤销/换发凭证、耗尽额度均不复活。
+- **快照外部阅览时段**：
+  - 时段字段 `window_open_at`/`window_close_at` 随 v6 迁移幂等补到 `snapshots` 与 `publish_requests`（带时区、可空），附“成对出现”与“开放早于截止”两条 CHECK；既有行两列均为 `NULL`，语义即**无时段限制**，既有发布/批准/读取行为完全不变；
+  - 时段只随快照**首次发布**确定：发布/批准用 `INSERT ... ON CONFLICT DO NOTHING` 复用同版本快照，冲突路径绝不写入时段；锁行后由 `_resolve_snapshot_window` 判定——省略沿用首次设置、绝对时刻相同（时区表达可不同）幂等放行、不同则 `409`，因此无窗口快照永远不能补设窗口，已有时段永远不能被改写；
+  - 请求模型校验成对填写与开放早于截止（`422`）；直接发布与受控申请提交另核对截止时刻仍在未来（`422`），申请把时段随冻结内容一同固定，复核耗时不改变它；批准时先在申请行锁内核对截止未到（已到则 `409`、申请保持待审仍可驳回），再在快照行锁内核对与首次时段一致；
+  - 公开读取在撤回、冻结检查之后、任何计数 `UPDATE` 与审计写入之前，以**服务端单次 `now`** 判定 `[open, close)`（开放含、截止不含）：窗口外直接模糊 `403`，**不扣单快照令牌或共享额度、不写成功读取审计**；窗口按单快照判定，共享凭证清单内其他快照不受影响；公开成功响应结构不变、不暴露时段。
 - **敏感短语清单核验**：
   - 新表 `sensitive_phrase_settings` 为**全表单行**（固定 `id=1` + `CHECK (id=1)`），存放当前启用清单（JSONB 短语数组）与单调 `version`；v5 迁移幂等建表并插入初始空清单行（`phrases=[]`、`version=1`，即停用核验），既有数据与发布/读取语义不变；
   - 清单由维护接口凭服务密钥**原子替换**（整份数组在同一事务更新并 `version=version+1`），非空/不重复/非空元素由请求模型校验；查询返回版本、短语与 `enabled` 标志；
@@ -940,7 +1022,7 @@ curl -s -H "X-Service-Key: $KEY" "$BASE/records/<RID>/freeze"
   - 表为只追加：启动迁移幂等安装触发器函数与行级/语句级触发器，拒绝任何 `UPDATE` / `DELETE` / `TRUNCATE`，应用层也无修改或删除入口；
   - 维护侧 `GET /snapshots/{id}/read-events`（服务密钥）按 `(snapshot_id, 时间窗口)` 过滤、按 `seq` 升序分页（索引 `(snapshot_id, seq)`），不透明游标承载窗口、页大小、`after_seq` 与首页快照——首页以查询开始时该快照已提交事件的最大 `seq` 为上界，配合公开读取“快照行锁串行提交”的性质，保证起点前已提交事件跨页**不重复、不遗漏**，查询期间新提交事件可留待下次查询；未知快照 `404`、非法窗口/游标 `422`、缺密钥 `401`。
 - **版本化数据库升级**：
-  - 版本表 `schema_migrations(version, name, applied_at)` 与升级链 v1 建表 / v2 历史缺列补齐与链标识回填 / v3 审计防改写触发器 / v4 记录临时冻结表与部分唯一索引 / v5 敏感短语清单单行配置表与初始停用行；空库从 v1 依次执行，升级框架出现前的旧库补登 v1 基线后只增量执行 v2/v3/v4/v5，已升级库只核对；
+  - 版本表 `schema_migrations(version, name, applied_at)` 与升级链 v1 建表 / v2 历史缺列补齐与链标识回填 / v3 审计防改写触发器 / v4 记录临时冻结表与部分唯一索引 / v5 敏感短语清单单行配置表与初始停用行 / v6 快照外部阅览时段列与 CHECK；空库从 v1 依次执行，升级框架出现前的旧库补登 v1 基线后只增量执行 v2/v3/v4/v5/v6，已升级库只核对；
   - 启动先取固定键的 PostgreSQL 会话级**咨询锁**：多实例并发只有一个执行升级，其余等待并在拿到锁后核对版本；进程崩溃则锁随连接释放，失败版本随事务回滚、未登记，重启可重试；
   - **每个版本独立事务**：DDL/回填与版本记录原子提交，已完成步骤绝不重放；回填只作用于 NULL 行，存量记录/快照/凭证、已用额度、换发链标识与审计事件均保留；
   - 升级后核对版本必须等于代码支持版本；库版本高于代码（未知较新版本）或升级失败时进入失败态，中间件对除 `/livez` 外的全部路径返回 `503`（不暴露鉴权/内部细节），`/readyz` 供编排就绪探针，修复后重启可恢复服务。
@@ -972,10 +1054,10 @@ python3 -m unittest tests.test_migrations -v
 ```
 app/
   main.py       # 路由与事务逻辑（受控发布、令牌计数、快照撤回、记录临时冻结、多快照共享凭证申请-复核与共用额度、凭证泄露换发、成功读取审计事件与分页查询、敏感短语清单维护与发布核验）；启动门禁与 /livez /readyz /healthz
-  migrations.py # 有版本记录的数据库升级：schema_migrations 版本表 + 咨询锁；v1 建表 / v2 历史缺列补齐与链标识回填 / v3 审计防改写触发器 / v4 记录冻结表与部分唯一索引 / v5 敏感短语配置表
-  models.py     # records / record_versions / snapshots(含撤回字段) / record_freezes(冻结期) / read_tokens(含换发链) / publish_requests / read_bundles(+requests/items，含换发链) / credential_rotations / read_audit_events(只追加) / sensitive_phrase_settings(启用清单单行)
+  migrations.py # 有版本记录的数据库升级：schema_migrations 版本表 + 咨询锁；v1 建表 / v2 历史缺列补齐与链标识回填 / v3 审计防改写触发器 / v4 记录冻结表与部分唯一索引 / v5 敏感短语配置表 / v6 快照外部阅览时段列与 CHECK
+  models.py     # records / record_versions / snapshots(含撤回字段与外部阅览时段) / record_freezes(冻结期) / read_tokens(含换发链) / publish_requests(含冻结时段) / read_bundles(+requests/items，含换发链) / credential_rotations / read_audit_events(只追加) / sensitive_phrase_settings(启用清单单行)
   redaction.py  # 区间校验、合并、替换与敏感短语字面量命中/覆盖核验（纯函数）
-  schemas.py    # 请求/响应模型（含撤回、记录冻结、max_reads、多快照共享凭证、泄露换发、读取审计与敏感短语清单模型）
+  schemas.py    # 请求/响应模型（含撤回、记录冻结、max_reads、外部阅览时段、多快照共享凭证、泄露换发、读取审计与敏感短语清单模型）
   security.py   # 服务密钥与操作者个人凭据（Basic）鉴权、角色依赖
   config.py     # 环境变量配置（含 REVIEW_CREDENTIALS 校验）
   db.py         # 引擎与会话
@@ -984,6 +1066,7 @@ examples/
   demo_controlled.sh  # 受控发布（申请-复核）端到端调用示例
   demo_withdraw.sh    # 快照永久撤回端到端调用示例
   demo_freeze.sh      # 记录临时冻结（冻结/查询/解除 + 并发边界语义）端到端调用示例
+  demo_windows.sh     # 快照外部阅览时段（窗口边界/沿用与冲突/受控拒批/共享凭证逐快照判定）端到端调用示例
   demo_bundles.sh     # 多快照共享凭证（申请-复核 + 共用额度）端到端调用示例
   demo_rotate.sh      # 读取凭证泄露换发（令牌/共享凭证统一入口）端到端调用示例
   demo_audit.sh       # 成功读取审计（不可变事件 + 换发链 + 游标分页）端到端调用示例

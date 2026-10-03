@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
@@ -28,11 +28,34 @@ class PublishRequest(BaseModel):
     # 可选的成功读取次数上限（正整数）；不填表示不限次。
     # 直接发布时确定；受控发布在提交申请时冻结，批准签发后生效。
     max_reads: int | None = Field(default=None, gt=0)
+    # 可选的外部阅览时段（带时区的 ISO 8601 时刻；naive 时刻按 UTC 处理）：
+    # 两者必须同时填写或同时省略；开放时刻必须早于截止时刻。
+    # 省略表示本次签发不携带时段：快照首次发布未带时段则无时段限制（兼容既有请求），
+    # 快照已有时段则沿用首次设置。显式填写与快照既有时段不同将在发布/批准时 409。
+    window_open_at: datetime | None = None
+    window_close_at: datetime | None = None
 
     @model_validator(mode="after")
     def _only_one_expiry(self):
         if self.expires_in_seconds is not None and self.expires_at is not None:
             raise ValueError("use only one of expires_in_seconds and expires_at")
+        return self
+
+    @model_validator(mode="after")
+    def _window_complete_and_ordered(self):
+        if (self.window_open_at is None) != (self.window_close_at is None):
+            raise ValueError(
+                "window_open_at and window_close_at must be provided together"
+            )
+        if self.window_open_at is not None and self.window_close_at is not None:
+            open_at = self.window_open_at
+            close_at = self.window_close_at
+            if open_at.tzinfo is None:
+                open_at = open_at.replace(tzinfo=timezone.utc)
+            if close_at.tzinfo is None:
+                close_at = close_at.replace(tzinfo=timezone.utc)
+            if open_at >= close_at:
+                raise ValueError("window_open_at must be earlier than window_close_at")
         return self
 
 
@@ -113,6 +136,9 @@ class SnapshotInfo(BaseModel):
     # 维护侧状态：撤回时间与原因；未撤回时均为 null（原因不向公开侧透露）
     withdrawn_at: datetime | None = None
     withdraw_reason: str | None = None
+    # 外部阅览时段：均为 null 表示无时段限制；否则公开读取仅在 [open, close) 内有效
+    window_open_at: datetime | None = None
+    window_close_at: datetime | None = None
 
 
 class RecordStatusResponse(BaseModel):
@@ -131,6 +157,9 @@ class PublishResponse(BaseModel):
     expires_at: datetime | None
     # 该令牌的成功读取次数上限；null 表示不限次
     max_reads: int | None = None
+    # 该快照生效中的外部阅览时段；均为 null 表示无时段限制
+    window_open_at: datetime | None = None
+    window_close_at: datetime | None = None
 
 
 class TokenStatusResponse(BaseModel):
@@ -181,6 +210,10 @@ class PublishRequestInfo(BaseModel):
     token_expires_at: datetime | None
     # 申请时冻结的读取次数上限；null 表示不限次
     token_max_reads: int | None
+    # 提交时冻结的外部阅览时段；均为 null 表示本申请未携带时段
+    # （批准时沿用快照首次发布已有时段，或最终无时段限制）
+    window_open_at: datetime | None
+    window_close_at: datetime | None
     snapshot_id: UUID | None
     created_at: datetime
     decided_at: datetime | None
@@ -198,6 +231,9 @@ class ControlledSubmitResponse(BaseModel):
     status: str
     requested_by: str
     created_at: datetime
+    # 提交时冻结的外部阅览时段；均为 null 表示本申请未携带时段
+    window_open_at: datetime | None = None
+    window_close_at: datetime | None = None
 
 
 class ApproveResponse(BaseModel):
@@ -211,6 +247,9 @@ class ApproveResponse(BaseModel):
     expires_at: datetime | None
     # 批准签发令牌的成功读取次数上限；null 表示不限次
     max_reads: int | None = None
+    # 该快照生效中的外部阅览时段；均为 null 表示无时段限制
+    window_open_at: datetime | None = None
+    window_close_at: datetime | None = None
 
 
 # ---- 多快照共享凭证（read bundle） ----

@@ -174,8 +174,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.8.0",
-    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 版本化数据库升级）",
+    version="1.9.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 快照外部阅览时段 + 版本化数据库升级）",
     lifespan=lifespan,
 )
 
@@ -309,6 +309,8 @@ def _request_info(request: PublishRequestModel) -> PublishRequestInfo:
         token_expires_in_seconds=request.token_expires_in_seconds,
         token_expires_at=request.token_expires_at,
         token_max_reads=request.token_max_reads,
+        window_open_at=request.window_open_at,
+        window_close_at=request.window_close_at,
         snapshot_id=request.snapshot_id,
         created_at=request.created_at,
         decided_at=request.decided_at,
@@ -332,6 +334,87 @@ def _validate_expiry_policy(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="expires_at must be in the future",
         )
+
+
+def _normalize_window(
+    window_open_at: datetime | None, window_close_at: datetime | None
+) -> tuple[datetime | None, datetime | None]:
+    """把请求携带的外部阅览时段统一为 UTC aware 时刻对。
+
+    成对性（同填或同省）与开放早于截止已在请求 schema（422）校验；这里只做
+    naive -> UTC 与时区归一，供落库与逐时刻比较使用。
+    """
+    if window_open_at is None or window_close_at is None:
+        return None, None
+    open_at = window_open_at
+    close_at = window_close_at
+    if open_at.tzinfo is None:
+        open_at = open_at.replace(tzinfo=timezone.utc)
+    if close_at.tzinfo is None:
+        close_at = close_at.replace(tzinfo=timezone.utc)
+    return open_at.astimezone(timezone.utc), close_at.astimezone(timezone.utc)
+
+
+def _validate_window_at_submission(close_at: datetime | None) -> None:
+    """提交（直接发布/受控申请）时核对时段：截止时刻必须仍晚于当前服务端时刻。
+
+    开放时刻可以落在过去（允许“立即开放”）；截止已到则整次请求 422 拒绝，
+    不产生快照、令牌或待审申请。成对性与开放早于截止由 schema 保证。
+    """
+    if close_at is not None and close_at <= datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="window_close_at must be in the future",
+        )
+
+
+def _resolve_snapshot_window(
+    *,
+    existing_open_at: datetime | None,
+    existing_close_at: datetime | None,
+    requested_open_at: datetime | None,
+    requested_close_at: datetime | None,
+) -> tuple[datetime | None, datetime | None]:
+    """在已锁定的快照行上确定本次签发后生效的外部阅览时段。
+
+    快照时段只随首次发布确定、此后不可变：
+    - 本次省略时段 -> 原样沿用快照既有时段（首次设置或仍为无限制）；
+    - 本次显式填写且与既有时段完全相同 -> 幂等放行（重复发布同一设置）；
+    - 本次显式填写但与既有时段不同 -> 409 冲突拒绝，绝不改写快照
+      （含“已无限制的快照想补设时段”与“想改动已有时段”两种情形）。
+    """
+    requested_pair = (requested_open_at, requested_close_at)
+    existing_pair = (existing_open_at, existing_close_at)
+    if requested_open_at is None:
+        return existing_pair
+    if existing_open_at is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="snapshot has no reading window; its first publish set no window",
+        )
+    if requested_pair != existing_pair:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "snapshot reading window is fixed at its first publish "
+                "and cannot be changed",
+                "window_open_at": existing_open_at.isoformat(),
+                "window_close_at": existing_close_at.isoformat(),
+            },
+        )
+    return existing_pair
+
+
+def _window_active(
+    snapshot: Snapshot, now: datetime
+) -> bool:
+    """服务端资格判定时刻 now 是否落在快照外部阅览时段 [open, close) 内。
+
+    无时段（两列为 NULL）恒为有效窗口；带时段时开放时刻起含、截止时刻前不含。
+    """
+    if snapshot.window_open_at is None or snapshot.window_close_at is None:
+        return True
+    return snapshot.window_open_at <= now < snapshot.window_close_at
 
 
 def _bundle_request_info(request: ReadBundleRequest) -> BundleRequestInfo:
@@ -509,6 +592,11 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
     """直接发布指定版本：合并区间生成不可变快照，并签发随机读取令牌。
 
     受控记录的直接发布请求一律 409 拒绝，必须走申请-复核流程。
+
+    可随版本携带带时区的外部阅览时段 window_open_at/window_close_at：两者须同时
+    填写且开放早于截止，提交时截止已到则 422 拒绝；均省略表示不携带时段——
+    快照首次发布未带时段则无时段限制（兼容既有请求），已有时段则沿用首次设置。
+    时段只随快照首次发布固定：同版本后续签发显式填写不同时段一律 409，不改写快照。
     """
     record = db.get(Record, record_id)
     if record is None:
@@ -526,6 +614,11 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
             status_code=status.HTTP_404_NOT_FOUND, detail="record version not found"
         )
     expires_at = _future_expires_at(payload.expires_in_seconds, payload.expires_at)
+    window_open_at, window_close_at = _normalize_window(
+        payload.window_open_at, payload.window_close_at
+    )
+    # 提交时截止已到则整次拒绝（成对性/开放早于截止已在 schema 422 校验）
+    _validate_window_at_submission(window_close_at)
     version_intervals = [(iv["start"], iv["end"]) for iv in version.intervals]
     # 敏感短语核验：先锁清单单行并在锁内核验，行锁持有至本次发布提交，
     # 保证核验与提交对应同一已提交清单版本（与清单替换并发时按事务先后串行）。
@@ -534,9 +627,17 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
     redacted = redact_text(version.original_text, version_intervals)
     # 快照按 (record_id, version) 唯一：并发发布时唯一约束保证只落库一份，
     # 且快照与令牌在同一事务提交，不会出现部分发布。
+    # 外部阅览时段只由首次发布写入：后续签发复用快照时 on_conflict_do_nothing
+    # 绝不覆盖既有时段；省略时段沿用首次设置，显式不同设置在锁行后冲突拒绝。
     db.execute(
         pg_insert(Snapshot)
-        .values(record_id=record_id, version=payload.version, redacted_text=redacted)
+        .values(
+            record_id=record_id,
+            version=payload.version,
+            redacted_text=redacted,
+            window_open_at=window_open_at,
+            window_close_at=window_close_at,
+        )
         .on_conflict_do_nothing(constraint="uq_snapshots_record_version")
     )
     # 锁定快照行后再判定撤回状态：与撤回操作串行化，
@@ -552,6 +653,13 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
             status_code=status.HTTP_409_CONFLICT,
             detail="snapshot has been withdrawn and cannot be published again",
         )
+    # 快照时段首次发布后不可变：本次省略则沿用，显式不同则 409（不改写快照）。
+    effective_open_at, effective_close_at = _resolve_snapshot_window(
+        existing_open_at=snapshot.window_open_at,
+        existing_close_at=snapshot.window_close_at,
+        requested_open_at=window_open_at,
+        requested_close_at=window_close_at,
+    )
     token = ReadToken(
         token=secrets.token_urlsafe(32),
         snapshot_id=snapshot.id,
@@ -568,6 +676,8 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
         "token": token.token,
         "expires_at": expires_at,
         "max_reads": payload.max_reads,
+        "window_open_at": effective_open_at,
+        "window_close_at": effective_close_at,
     }
 
 
@@ -582,7 +692,14 @@ def submit_publish_request(
     operator: Operator = Depends(require_role("operator")),
     db: Session = Depends(get_db),
 ):
-    """提交受控发布申请：用申请人的个人凭据，冻结提交时刻的历史版本内容。"""
+    """提交受控发布申请：用申请人的个人凭据，冻结提交时刻的历史版本内容。
+
+    可随申请携带带时区的外部阅览时段 window_open_at/window_close_at（两者同时填写、
+    开放早于截止，截止已到则 422），时段在提交时随申请冻结，复核耗时不改变它；
+    均省略表示不携带时段。批准时若冻结时段的截止已到则拒绝批准（409），申请仍
+    待审、可驳回；批准签发时若申请时段与快照首次发布已有时段不一致则整次批准
+    失败，绝不改写快照。
+    """
     record = db.get(Record, record_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="record not found")
@@ -612,6 +729,12 @@ def submit_publish_request(
     expires_at = payload.expires_at
     if expires_at is not None and expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
+    # 外部阅览时段在提交时随申请冻结：成对性/开放早于截止已在 schema 校验，
+    # 截止已到则整次拒绝，不产生待审申请；复核耗时不改变冻结的时段。
+    window_open_at, window_close_at = _normalize_window(
+        payload.window_open_at, payload.window_close_at
+    )
+    _validate_window_at_submission(window_close_at)
     frozen_intervals = [dict(iv) for iv in version.intervals]
     # 提交即须按当前启用清单核验拟发布版本原文：不通过整次拒绝，不产生待审申请。
     _verify_phrases_cover_text(
@@ -628,6 +751,8 @@ def submit_publish_request(
         token_expires_in_seconds=payload.expires_in_seconds,
         token_expires_at=expires_at,
         token_max_reads=payload.max_reads,
+        window_open_at=window_open_at,
+        window_close_at=window_close_at,
     )
     db.add(request)
     db.commit()
@@ -638,6 +763,8 @@ def submit_publish_request(
         status=request.status,
         requested_by=request.requested_by,
         created_at=request.created_at,
+        window_open_at=window_open_at,
+        window_close_at=window_close_at,
     )
 
 
@@ -654,6 +781,10 @@ def approve_publish_request(
 
     申请人不得复核；已终态（批准/驳回）的申请一律 409；
     行锁串行化并发复核，保证同一申请只有一个终态。
+
+    申请冻结了外部阅览时段时：截止时刻已到则拒绝批准（409），申请保持待审、
+    仍可驳回；时段与同版本快照首次发布已有时段不同则 409，绝不改写快照；
+    申请未带时段则沿用快照既有时段（首次设置或仍为无限制）。
     """
     # SELECT ... FOR UPDATE：并发复核在此排队，后进入者会看到已终态并被拒绝
     request = db.execute(
@@ -681,12 +812,20 @@ def approve_publish_request(
 
     # 快照与令牌在同一事务内生成：任一步失败整体回滚，不会留下可读令牌。
     # 相对到期时长在签发时刻换算为绝对时刻；显式到期时刻沿用申请时的选择。
+    now = datetime.now(timezone.utc)
     if request.token_expires_in_seconds is not None:
-        token_expires_at = datetime.now(timezone.utc) + timedelta(
-            seconds=request.token_expires_in_seconds
-        )
+        token_expires_at = now + timedelta(seconds=request.token_expires_in_seconds)
     else:
         token_expires_at = request.token_expires_at
+    # 外部阅览时段在申请提交时已冻结；批准时若截止时刻已到，拒绝批准：
+    # 不产生快照或令牌，申请保持待审、仍可被驳回。
+    if request.window_close_at is not None and request.window_close_at <= now:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="frozen reading window has already closed; "
+            "the request stays pending and may be rejected",
+        )
     frozen_intervals = [(iv["start"], iv["end"]) for iv in request.frozen_intervals]
     # 批准时用“当时启用”的清单重新核验申请冻结的原文与区间（清单可能已在等待
     # 期间变更）。先锁清单单行再锁快照行，锁序与直接发布一致、不会死锁；不通过
@@ -699,6 +838,8 @@ def approve_publish_request(
             record_id=request.record_id,
             version=request.version,
             redacted_text=redacted,
+            window_open_at=request.window_open_at,
+            window_close_at=request.window_close_at,
         )
         .on_conflict_do_nothing(constraint="uq_snapshots_record_version")
     )
@@ -717,6 +858,15 @@ def approve_publish_request(
             status_code=status.HTTP_409_CONFLICT,
             detail="snapshot of this version has been withdrawn",
         )
+    # 快照时段只随首次发布确定：申请未带时段则沿用快照既有时段（首次设置或仍为
+    # 无限制）；申请显式冻结的时段与快照既有时段不同则整次批准失败，绝不改写快照，
+    # 申请保持待审、仍可驳回。
+    effective_open_at, effective_close_at = _resolve_snapshot_window(
+        existing_open_at=snapshot.window_open_at,
+        existing_close_at=snapshot.window_close_at,
+        requested_open_at=request.window_open_at,
+        requested_close_at=request.window_close_at,
+    )
     token = ReadToken(
         token=secrets.token_urlsafe(32),
         snapshot_id=snapshot.id,
@@ -729,7 +879,7 @@ def approve_publish_request(
     request.reviewed_by = operator.username
     request.snapshot_id = snapshot.id
     request.token_expires_at = token_expires_at
-    request.decided_at = datetime.now(timezone.utc)
+    request.decided_at = now
     db.commit()
     return ApproveResponse(
         request_id=request.id,
@@ -741,6 +891,8 @@ def approve_publish_request(
         token=token.token,
         expires_at=token_expires_at,
         max_reads=request.token_max_reads,
+        window_open_at=effective_open_at,
+        window_close_at=effective_close_at,
     )
 
 
@@ -1574,6 +1726,8 @@ def get_record(record_id: UUID, db: Session = Depends(get_db)):
                 published_at=s.published_at,
                 withdrawn_at=s.withdrawn_at,
                 withdraw_reason=s.withdraw_reason,
+                window_open_at=s.window_open_at,
+                window_close_at=s.window_close_at,
             )
             for s in snapshots
         ],
@@ -1802,6 +1956,12 @@ def read_snapshot(
     后开始的读取按各自凭证的既有资格继续判定。冻结覆盖该记录现有及冻结期间
     新发布的全部快照；共享凭证中属于其他记录的快照不受影响、仍可读取。
 
+    外部阅览时段（随快照首次发布固定，不可变）：带时段的快照仅在
+    [window_open_at, window_close_at) 内可读取——开放时刻起含、截止时刻前不含，
+    一律以服务端资格判定时刻为准；开放前或截止后的读取沿用同一模糊 403，
+    不扣次数、不写成功读取审计。时段是每快照属性：同一条共享凭证读取清单内
+    其他快照不受窗口外快照影响。无时段快照（维护侧两字段均为 null）不受限制。
+
     单快照令牌：有效性判定与次数消耗由同一条条件 UPDATE 原子完成
     （未撤销、未到期、(不限次或 reads_used < max_reads)）。
 
@@ -1822,7 +1982,7 @@ def read_snapshot(
         select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
     ).scalar_one_or_none()
     if snapshot is None or snapshot.withdrawn_at is not None:
-        # 不区分“快照不存在 / 已撤回 / 已冻结 / 令牌或凭证无效 / 已撤销 / 已过期 / 次数用尽 / 不在清单”，
+        # 不区分“快照不存在 / 已撤回 / 已冻结 / 阅览窗口外 / 令牌或凭证无效 / 已撤销 / 已过期 / 次数用尽 / 不在清单”，
         # 快照不存在或已撤回时直接拒绝，不触碰任何读取计数，也不写审计事件。
         db.rollback()
         raise HTTPException(
@@ -1850,6 +2010,16 @@ def read_snapshot(
             status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
         )
     now = datetime.now(timezone.utc)
+    # 外部阅览时段（随快照首次发布固定）：仅在 [window_open_at, window_close_at)
+    # 内放行，开放时刻起含、截止时刻前不含，以服务端资格判定时刻 now 为准。
+    # 窗口外沿用与撤回/冻结完全一致的模糊 403：不区分原因，不执行任何计数 UPDATE
+    # （不扣单快照令牌或共享凭证次数），不写成功读取审计；时段是每快照属性，
+    # 同凭证清单内其他快照不受影响。无时段快照（两列为 NULL）恒通过本检查。
+    if not _window_active(snapshot, now):
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+        )
     # 优先按既有单快照令牌判定（行为与响应完全保持兼容）。
     # RETURNING chain_id：只有真正完成扣次的成功读取才取回换发链标识并写事件。
     token_chain_id = db.execute(

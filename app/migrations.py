@@ -223,6 +223,60 @@ def _migrate_5_sensitive_phrases(conn) -> None:
     )
 
 
+def _migrate_6_snapshot_windows(conn) -> None:
+    """v6：快照外部阅览时段（snapshots 与受控申请各两列 + 完整性约束）。
+
+    空库路径下 v1 的 create_all 已按当前模型建出带新列与约束的完整表，此处幂等；
+    旧库路径先按当前模型补齐可能缺失的整张表，再以 IF NOT EXISTS 补列，并以
+    DO 块幂等收敛 CHECK 约束（约束已存在时捕获 duplicate_object 跳过）。
+
+    新列对既有行一律为 NULL：NULL 对表示“无时段限制”，全部既有快照/待审申请的
+    发布、批准与公开读取语义完全不变；历史数据不被回填、不被改写。
+    """
+    Base.metadata.create_all(bind=conn, checkfirst=True)
+    statements: list[str] = [
+        # 快照首次发布时确定的统一外部阅览时段；既有快照无时段（NULL 对）
+        "ALTER TABLE snapshots "
+        "ADD COLUMN IF NOT EXISTS window_open_at TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE snapshots "
+        "ADD COLUMN IF NOT EXISTS window_close_at TIMESTAMP WITH TIME ZONE",
+        # 受控申请提交时冻结的时段；既有待审/终态申请均未携带时段（NULL 对）
+        "ALTER TABLE publish_requests "
+        "ADD COLUMN IF NOT EXISTS window_open_at TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE publish_requests "
+        "ADD COLUMN IF NOT EXISTS window_close_at TIMESTAMP WITH TIME ZONE",
+    ]
+    for statement in statements:
+        conn.execute(text(statement))
+
+    # CHECK 约束幂等收敛：create_all 已建出时跳过（42P06/42710 duplicate_object）。
+    # 既有行两列同为 NULL，约束首次添加必然成立，不重写任何历史数据。
+    check_constraints = (
+        ("snapshots", "ck_snapshots_window_both_or_neither",
+         "(window_open_at IS NULL) = (window_close_at IS NULL)"),
+        ("snapshots", "ck_snapshots_window_open_before_close",
+         "window_open_at IS NULL OR window_open_at < window_close_at"),
+        ("publish_requests", "ck_publish_requests_window_both_or_neither",
+         "(window_open_at IS NULL) = (window_close_at IS NULL)"),
+        ("publish_requests", "ck_publish_requests_window_open_before_close",
+         "window_open_at IS NULL OR window_open_at < window_close_at"),
+    )
+    for table_name, constraint_name, expression in check_constraints:
+        conn.execute(
+            text(
+                f"""
+                DO $$
+                BEGIN
+                    ALTER TABLE {table_name}
+                    ADD CONSTRAINT {constraint_name} CHECK ({expression});
+                EXCEPTION
+                    WHEN duplicate_object THEN NULL;
+                END $$;
+                """
+            )
+        )
+
+
 # (版本号, 版本名称, 升级函数)。追加新版本时只允许在末尾追加，永不改写历史版本。
 MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (1, "initial_schema", _migrate_1_initial_schema),
@@ -230,6 +284,7 @@ MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (3, "audit_events_append_only", _migrate_3_audit_append_only),
     (4, "record_freezes", _migrate_4_record_freezes),
     (5, "sensitive_phrases", _migrate_5_sensitive_phrases),
+    (6, "snapshot_windows", _migrate_6_snapshot_windows),
 )
 
 TARGET_SCHEMA_VERSION = MIGRATIONS[-1][0]

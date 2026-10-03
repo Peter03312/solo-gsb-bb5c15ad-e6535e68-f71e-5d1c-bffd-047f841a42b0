@@ -102,9 +102,6 @@ class Snapshot(Base):
     """发布产生的不可变快照：只保存脱敏后的正文，后续修订不影响它。"""
 
     __tablename__ = "snapshots"
-    __table_args__ = (
-        UniqueConstraint("record_id", "version", name="uq_snapshots_record_version"),
-    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     record_id: Mapped[uuid.UUID] = mapped_column(
@@ -122,6 +119,28 @@ class Snapshot(Base):
     )
     # 撤回原因仅维护侧可见，公开侧的模糊 403 绝不透露它
     withdraw_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 外部阅览时段（统一开放窗口）：两者同时为空表示无时段限制（既有快照默认如此）；
+    # 两者同时非空时，公开读取仅在 [window_open_at, window_close_at) 内有效。
+    # 时段只随快照首次发布确定，此后不可变：后续签发省略则沿用、显式不同则冲突拒绝。
+    # CHECK 约束保证“同空同非空且开放早于截止”；应用层另在发布/批准时核对截止未到。
+    window_open_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    window_close_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint("record_id", "version", name="uq_snapshots_record_version"),
+        CheckConstraint(
+            "(window_open_at IS NULL) = (window_close_at IS NULL)",
+            name="ck_snapshots_window_both_or_neither",
+        ),
+        CheckConstraint(
+            "window_open_at IS NULL OR window_open_at < window_close_at",
+            name="ck_snapshots_window_open_before_close",
+        ),
+    )
 
 
 class ReadToken(Base):
@@ -185,6 +204,14 @@ class PublishRequest(Base):
     __tablename__ = "publish_requests"
     __table_args__ = (
         CheckConstraint("status IN ('pending', 'approved', 'rejected')", name="ck_publish_requests_status"),
+        CheckConstraint(
+            "(window_open_at IS NULL) = (window_close_at IS NULL)",
+            name="ck_publish_requests_window_both_or_neither",
+        ),
+        CheckConstraint(
+            "window_open_at IS NULL OR window_open_at < window_close_at",
+            name="ck_publish_requests_window_open_before_close",
+        ),
         Index("ix_publish_requests_record", "record_id", "created_at"),
     )
 
@@ -209,6 +236,18 @@ class PublishRequest(Base):
     token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 读取次数上限（申请时冻结）：NULL 表示不限次，批准后原样落到新令牌
     token_max_reads: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # 外部阅览时段（提交时冻结，复核耗时不改变它）：两者同时为空表示本申请不携带
+    # 时段（批准时沿用快照首次发布已有时段，或最终无时段限制）；两者同时非空时
+    # 申请绑定的快照只能在 [window_open_at, window_close_at) 内公开读取。
+    # 批准时若截止已到则拒绝批准（申请保持待审、仍可驳回）；批准签发时时段落到快照，
+    # 与快照既有时段不一致则整次批准失败，绝不改写快照。
+    window_open_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    window_close_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # 批准后同事务生成的快照（驳回时保持为空；令牌经 snapshot_id 关联，不在此冗余）
     snapshot_id: Mapped[uuid.UUID | None] = mapped_column(

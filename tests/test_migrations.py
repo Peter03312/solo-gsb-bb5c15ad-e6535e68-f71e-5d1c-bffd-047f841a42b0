@@ -132,8 +132,8 @@ class FreshDatabaseUpgradeTests(unittest.TestCase):
     def test_fresh_database_applies_every_version_in_order(self):
         previous, applied = migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
         self.assertEqual(previous, 0)
-        self.assertEqual(applied, [1, 2, 3, 4, 5])
-        self.assertEqual(self._versions(), {1, 2, 3, 4, 5})
+        self.assertEqual(applied, [1, 2, 3, 4, 5, 6])
+        self.assertEqual(self._versions(), {1, 2, 3, 4, 5, 6})
         tables = set(inspect(self.engine).get_table_names())
         self.assertIn("schema_migrations", tables)
         for expected in (
@@ -154,6 +154,55 @@ class FreshDatabaseUpgradeTests(unittest.TestCase):
         # “每条记录至多一个当前冻结期”的部分唯一索引随 v1 建表即存在
         indexes = {ix["name"] for ix in inspect(self.engine).get_indexes("record_freezes")}
         self.assertIn("uq_record_freezes_active", indexes)
+        # v6 时段完整性约束：成对出现 + 开放早于截止（快照与申请各一对）
+        with self.engine.connect() as conn:
+            snap_checks = {
+                row[0]
+                for row in conn.execute(
+                    text(
+                        "SELECT conname FROM pg_constraint WHERE conrelid = 'snapshots'::regclass "
+                        "AND contype = 'c'"
+                    )
+                ).all()
+            }
+            self.assertIn("ck_snapshots_window_both_or_neither", snap_checks)
+            self.assertIn("ck_snapshots_window_open_before_close", snap_checks)
+            req_checks = {
+                row[0]
+                for row in conn.execute(
+                    text(
+                        "SELECT conname FROM pg_constraint "
+                        "WHERE conrelid = 'publish_requests'::regclass AND contype = 'c'"
+                    )
+                ).all()
+            }
+            self.assertIn("ck_publish_requests_window_both_or_neither", req_checks)
+            self.assertIn("ck_publish_requests_window_open_before_close", req_checks)
+        # CHECK 真实生效：插入只带单列时段的快照违反“成对出现”约束，整事务回滚
+        from sqlalchemy.exc import DBAPIError as _DBAPIError
+
+        with self.assertRaises(_DBAPIError):
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO records (id, current_version, created_at, updated_at) "
+                        "VALUES ('77777777-7777-7777-7777-777777777777', 1, now(), now())"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO snapshots (id, record_id, version, redacted_text, "
+                        "published_at, window_open_at) VALUES "
+                        "('88888888-8888-8888-8888-888888888888', "
+                        "'77777777-7777-7777-7777-777777777777', 1, 'x', now(), now())"
+                    )
+                )
+        with self.engine.connect() as conn:
+            # 违反约束的插入连同先写入的记录一并回滚，不留残数据
+            self.assertEqual(conn.execute(text("SELECT count(*) FROM records")).scalar_one(), 0)
+            self.assertEqual(
+                conn.execute(text("SELECT count(*) FROM snapshots")).scalar_one(), 0
+            )
         # v5 幂等插入固定单行：空清单（停用核验）、version=1
         with self.engine.connect() as conn:
             sid, phrases, version = conn.execute(
@@ -177,7 +226,7 @@ class FreshDatabaseUpgradeTests(unittest.TestCase):
             f"eng = create_engine({self.url!r});"
             "prev, applied = migrations.run_upgrade(eng, connect_retries=1, connect_retry_delay=0);"
             "names = set(inspect(eng).get_table_names());"
-            "assert applied == [1, 2, 3, 4, 5], applied;"
+            "assert applied == [1, 2, 3, 4, 5, 6], applied;"
             "assert 'records' in names and 'read_audit_events' in names, names;"
             "assert 'sensitive_phrase_settings' in names, names;"
             "print('SELF_CONTAINED_OK')"
@@ -326,9 +375,9 @@ class LegacyDatabaseUpgradeTests(unittest.TestCase):
             )
 
         previous, applied = migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
-        # 旧库补登 v1 基线：v1 不重放，只增量执行 v2/v3/v4/v5
+        # 旧库补登 v1 基线：v1 不重放，只增量执行 v2/v3/v4/v5/v6
         self.assertEqual(previous, 1)
-        self.assertEqual(applied, [2, 3, 4, 5])
+        self.assertEqual(applied, [2, 3, 4, 5, 6])
 
         with self.engine.connect() as conn:
             baseline_name = conn.execute(
@@ -337,6 +386,24 @@ class LegacyDatabaseUpgradeTests(unittest.TestCase):
             self.assertIn("基线", baseline_name)
             columns = {c["name"] for c in inspect(self.engine).get_columns("records")}
             self.assertIn("controlled", columns)
+            # v6 在旧库幂等补出快照/申请的时段列：既有快照两列为 NULL（无时段限制）
+            snap_cols = {c["name"] for c in inspect(self.engine).get_columns("snapshots")}
+            self.assertIn("window_open_at", snap_cols)
+            self.assertIn("window_close_at", snap_cols)
+            req_cols = {
+                c["name"] for c in inspect(self.engine).get_columns("publish_requests")
+            }
+            self.assertIn("window_open_at", req_cols)
+            self.assertIn("window_close_at", req_cols)
+            open_at, close_at = conn.execute(
+                text(
+                    "SELECT window_open_at, window_close_at FROM snapshots "
+                    "WHERE id = :sid"
+                ),
+                {"sid": snapshot_id},
+            ).one()
+            self.assertIsNone(open_at)
+            self.assertIsNone(close_at)
             # v5 在旧库幂等补出固定单行：空清单停用核验，既有语义不变
             sid, phrases, sp_version = conn.execute(
                 text("SELECT id, phrases, version FROM sensitive_phrase_settings")
@@ -419,7 +486,7 @@ class LegacyDatabaseUpgradeTests(unittest.TestCase):
             )
 
         previous, applied = migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
-        self.assertEqual((previous, applied), (1, [2, 3, 4, 5]))
+        self.assertEqual((previous, applied), (1, [2, 3, 4, 5, 6]))
         with self.engine.connect() as conn:
             reads_used, chain_id, rotated = conn.execute(
                 text(
@@ -506,7 +573,7 @@ class NewerAndFailureHandlingTests(unittest.TestCase):
         migrations.run_upgrade(self.engine, connect_retries=1, connect_retry_delay=0)
         # 回到“只完成 v1”的状态，让升级重新尝试 v2
         with self.engine.begin() as conn:
-            conn.execute(text("DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5)"))
+            conn.execute(text("DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6)"))
             conn.execute(
                 text(
                     "DROP TRIGGER IF EXISTS trg_read_audit_events_no_update "
@@ -562,13 +629,13 @@ class NewerAndFailureHandlingTests(unittest.TestCase):
             self.engine, connect_retries=1, connect_retry_delay=0
         )
         self.assertEqual(previous, 1)
-        self.assertEqual(applied, [2, 3, 4, 5])
+        self.assertEqual(applied, [2, 3, 4, 5, 6])
         with self.engine.connect() as conn:
             versions = {
                 row[0]
                 for row in conn.execute(text("SELECT version FROM schema_migrations"))
             }
-        self.assertEqual(versions, {1, 2, 3, 4, 5})
+        self.assertEqual(versions, {1, 2, 3, 4, 5, 6})
         # v4 收敛出冻结表与部分唯一索引
         with self.engine.connect() as conn:
             freeze_table = conn.execute(
@@ -643,7 +710,7 @@ class ConcurrentStartupTests(unittest.TestCase):
         self.assertTrue(all(isinstance(r, tuple) for r in results), results)
         # 恰好一个实例真正执行了 [1,2,3,4,5]，其余 applied 为空
         applied_lists = [applied for _, applied in results]
-        self.assertEqual(sorted(applied_lists, key=len, reverse=True)[0], [1, 2, 3, 4, 5])
+        self.assertEqual(sorted(applied_lists, key=len, reverse=True)[0], [1, 2, 3, 4, 5, 6])
         self.assertTrue(all(applied == [] for applied in applied_lists[1:]), applied_lists)
         with self.engine.connect() as conn:
             versions = [
@@ -652,7 +719,7 @@ class ConcurrentStartupTests(unittest.TestCase):
                     text("SELECT version FROM schema_migrations ORDER BY version")
                 )
             ]
-        self.assertEqual(versions, [1, 2, 3, 4, 5])
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6])
 
     def test_advisory_lock_key_is_stable(self):
         # 锁键固定：各实例竞争的是同一把集群级锁
